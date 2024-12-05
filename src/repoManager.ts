@@ -181,41 +181,66 @@ export class RepoManager {
         const git = simpleGit(repoPath);
         
         try {
-            // Get the contents
-            const oldContent = await git.show([oldCommit]);
-            const newContent = await git.show([newCommit]);
-            
-            // Create in-memory URIs instead of file URIs
-            const oldUri = vscode.Uri.parse(
-                `git:${path.join(repoPath, 'OLD_VERSION')}?${oldCommit}`
-            );
-            const newUri = vscode.Uri.parse(
-                `git:${path.join(repoPath, 'NEW_VERSION')}?${newCommit}`
-            );
+            // Create diff_reports directory
+            const reportsDir = path.join(repoPath, 'diff_reports');
+            await fs.mkdir(reportsDir, { recursive: true });
 
-            // Register content provider for our scheme
-            const contentProvider = new class implements vscode.TextDocumentContentProvider {
-                private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
-                
-                provideTextDocumentContent(uri: vscode.Uri): string {
-                    return uri.query === oldCommit ? oldContent : newContent;
+            // Generate timestamp for unique report name
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const reportName = `diff_${oldCommit.substring(0, 7)}_${newCommit.substring(0, 7)}_${timestamp}`;
+            const reportDir = path.join(reportsDir, reportName);
+            await fs.mkdir(reportDir);
+
+            // Get commit information for report metadata
+            const oldCommitInfo = await git.show([oldCommit, '--format=%h %an %s']);
+            const newCommitInfo = await git.show([newCommit, '--format=%h %an %s']);
+
+            // Get diff content
+            let oldContent: string;
+            let newContent: string;
+
+            try {
+                oldContent = await git.show([oldCommit]);
+            } catch (error) {
+                oldContent = '';
+            }
+
+            try {
+                newContent = await git.show([newCommit]);
+            } catch (error) {
+                this.log('Error getting new content, aborting diff view');
+                return;
+            }
+
+            // Create report files
+            const oldFile = path.join(reportDir, 'previous_version.txt');
+            const newFile = path.join(reportDir, 'new_version.txt');
+            const metadataFile = path.join(reportDir, 'metadata.json');
+
+            // Write content and metadata
+            await fs.writeFile(oldFile, oldContent);
+            await fs.writeFile(newFile, newContent);
+            await fs.writeFile(metadataFile, JSON.stringify({
+                timestamp: new Date().toISOString(),
+                previousCommit: {
+                    hash: oldCommit,
+                    info: oldCommitInfo.split('\n')[0]
+                },
+                newCommit: {
+                    hash: newCommit,
+                    info: newCommitInfo.split('\n')[0]
                 }
-                
-                get onDidChange(): vscode.Event<vscode.Uri> {
-                    return this._onDidChange.event;
-                }
-            };
+            }, null, 2));
 
-            // Register the provider
-            const registration = vscode.workspace.registerTextDocumentContentProvider(
-                'git',
-                contentProvider
-            );
+            // Create a summary file
+            const summaryFile = path.join(reportDir, 'summary.txt');
+            const diffSummary = await git.diff([oldCommit, newCommit, '--stat']);
+            await fs.writeFile(summaryFile, `Diff Summary\n${'-'.repeat(40)}\n${diffSummary}`);
 
-            // Show diff
+            // Show diff in VSCode
             await vscode.commands.executeCommand('vscode.diff',
-                oldUri,
-                newUri,
+                vscode.Uri.file(oldFile),
+                vscode.Uri.file(newFile),
                 `Changes: ${oldCommit.substring(0, 7)} ↔ ${newCommit.substring(0, 7)}`,
                 {
                     preview: true,
@@ -223,23 +248,37 @@ export class RepoManager {
                 }
             );
 
-            // Cleanup registration when diff is closed
-            const disposable = vscode.window.onDidChangeVisibleTextEditors(async (editors) => {
-                const diffStillOpen = editors.some(editor => 
-                    editor.document.uri.scheme === 'git' &&
-                    (editor.document.uri.query === oldCommit || 
-                     editor.document.uri.query === newCommit)
-                );
-                
-                if (!diffStillOpen) {
-                    registration.dispose();
-                    disposable.dispose();
+            // Add notification about saved report
+            vscode.window.showInformationMessage(
+                `Diff report saved to: ${reportDir}`,
+                'Open Report Directory'
+            ).then(selection => {
+                if (selection === 'Open Report Directory') {
+                    vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(reportDir));
                 }
             });
 
+            // Add to .gitignore if not already there
+            const gitignorePath = path.join(repoPath, '.gitignore');
+            try {
+                let gitignoreContent = '';
+                try {
+                    gitignoreContent = await fs.readFile(gitignorePath, 'utf8');
+                } catch (error) {
+                    // File doesn't exist yet
+                }
+
+                if (!gitignoreContent.includes('diff_reports/')) {
+                    const newLine = gitignoreContent.endsWith('\n') ? '' : '\n';
+                    await fs.writeFile(gitignorePath, `${gitignoreContent}${newLine}diff_reports/\n`);
+                }
+            } catch (error) {
+                this.log('Unable to update .gitignore, but diff report was still created');
+            }
+
         } catch (error) {
-            this.log(`Error showing visual diff: ${error instanceof Error ? error.message : 'Unknown error'}`);
-            throw error;
+            this.log(`Error showing and saving diff: ${error instanceof Error ? error.message : 'Unknown error'}`);
+            this.log('Continuing without diff view');
         }
     }
 
@@ -508,14 +547,10 @@ export class RepoManager {
                 // Directory exists, check if it's a git repo
                 const git = simpleGit(repoPath);
                 try {
-                    // Try to get git status to verify it's a git repo
                     await git.status();
                     this.log('Repository already exists and is valid');
-                    
-                    // Update the repo instead of cloning
                     await this.pullLatestChanges(repoPath);
                 } catch (gitError) {
-                    // Not a git repo - remove directory and clone fresh
                     this.log('Directory exists but is not a git repository');
                     this.log('Removing directory contents...');
                     await fs.rm(repoPath, { recursive: true, force: true });
@@ -528,6 +563,22 @@ export class RepoManager {
                 // Directory doesn't exist - just clone
                 this.log('Directory does not exist, cloning fresh...');
                 await this.git.clone(repoUrl, repoPath);
+            }
+            
+            // After clone, show the most recent commit changes
+            const git = simpleGit(repoPath);
+            try {
+                const log = await git.log({ maxCount: 2 }); // Get last 2 commits
+                if (log.all.length >= 2) {
+                    // Show diff between last two commits
+                    await this.showVisualDiff(repoPath, log.all[1].hash, log.all[0].hash);
+                } else if (log.all.length === 1) {
+                    // For first commit, show the complete changes
+                    const firstCommit = log.all[0].hash;
+                    await this.showVisualDiff(repoPath, '4b825dc642cb6eb9a060e54bf8d69288fbee4904', firstCommit);
+                }
+            } catch (error) {
+                this.log('Unable to show initial diff, continuing without diff view');
             }
             
             this.log('Clone/update operation completed successfully');
