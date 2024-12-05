@@ -20,132 +20,80 @@ export class RepoManager {
         const repoName = this.getRepoName(repoUrl);
         let repoPath = path.join(this.workspacePath, repoName);
 
-        try {
-            // Check if directory exists
-            await fs.access(repoPath, fs.constants.R_OK);
-            
-            // Check if it's a git repository
-            const git = simpleGit(repoPath);
+        // If we're in a workspace, check if it's our target repo
+        if (this.workspacePath) {
+            const git = simpleGit(this.workspacePath);
             try {
-                await git.status(); // Verify it's a git repo
+                // Check if it's a git repository
+                await git.status();
                 
-                // Existing repository found, fetch latest changes
-                this.log(`\n=== Starting update for existing repository: ${repoName} ===`);
-                this.log(`Repository path: ${repoPath}`);
-                
-                await vscode.window.withProgress({
-                    location: vscode.ProgressLocation.Notification,
-                    title: "Updating Repository",
-                    cancellable: false
-                }, async (progress) => {
-                    // Save current HEAD for later comparison
-                    const currentHead = await git.revparse(['HEAD']);
-                    this.log(`Current HEAD: ${currentHead}`);
-
-                    // Fetch all branches and tags
-                    progress.report({ message: 'Fetching latest changes...' });
-                    await git.fetch(['--all', '--prune']);
-                    this.log('Fetched all branches and tags');
-
-                    // Pull latest changes
-                    progress.report({ message: 'Pulling latest changes...' });
-                    await this.pullLatestChanges(repoPath);
+                // Check if it's our target repository
+                const remotes = await git.remote(['get-url', 'origin']);
+                if (remotes && remotes.trim() === repoUrl) {
+                    // Already in the correct repository
+                    this.log(`\n=== Analyzing current workspace repository ===`);
+                    this.log(`Repository path: ${this.workspacePath}`);
                     
-                    // Get new HEAD after pull
-                    const newHead = await git.revparse(['HEAD']);
-                    this.log(`New HEAD: ${newHead}`);
-
-                    // Show diff if changes were pulled
-                    if (currentHead !== newHead) {
-                        this.log('Changes detected, generating diff...');
-                        progress.report({ message: 'Generating diff view...' });
-                        await this.showVisualDiff(repoPath, currentHead, newHead);
-                    } else {
-                        this.log('No new changes to analyze');
-                    }
-
-                    progress.report({ message: 'Repository updated successfully!' });
-                });
-                
-            } catch (gitError) {
-                // Directory exists but not a git repository - ask user what to do
-                const choice = await vscode.window.showQuickPick(
-                    ['Clone Here', 'Clone in New Location', 'Cancel'],
-                    { placeHolder: 'Directory exists but is not a git repository. What would you like to do?' }
-                );
-
-                if (choice === 'Cancel') {
-                    throw new Error('Operation cancelled by user');
+                    await this.updateAndAnalyzeRepository(this.workspacePath);
+                    return this.workspacePath;
                 }
-
-                if (choice === 'Clone in New Location') {
-                    const result = await vscode.window.showOpenDialog({
-                        canSelectFiles: false,
-                        canSelectFolders: true,
-                        canSelectMany: false,
-                        title: 'Select Clone Location'
-                    });
-
-                    if (!result || result.length === 0) {
-                        throw new Error('No directory selected');
-                    }
-
-                    repoPath = path.join(result[0].fsPath, repoName);
-                }
-
-                // Clear existing directory if cloning here
-                if (choice === 'Clone Here') {
-                    await fs.rm(repoPath, { recursive: true, force: true });
-                }
-
-                await this.cloneRepository(repoUrl, repoPath);
-                
-                // If we're cloning to a new location, open in new window
-                if (choice === 'Clone in New Location') {
-                    // Store diff information before switching workspace
-                    const git = simpleGit(repoPath);
-                    const currentHead = await git.revparse(['HEAD']);
-                    // Use the parent commit as the old version
-                    const oldHead = await git.revparse(['HEAD^']) || currentHead;
-                    
-                    // Create diff files before switching workspace
-                    await this.showVisualDiff(repoPath, oldHead, currentHead);
-                    
-                    // Now switch workspace
-                    await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(repoPath));
-                    throw new Error('WORKSPACE_SWITCHED');
-                }
+            } catch (error) {
+                // Not a git repo or different repo
             }
-        } catch (error) {
-            if (error instanceof Error && error.message === 'WORKSPACE_SWITCHED') {
-                throw error;
+        }
+
+        // Ask user where to clone the repository
+        const choice = await vscode.window.showQuickPick(
+            [
+                'Clone in Current Folder',
+                'Clone in New Location',
+                'Cancel'
+            ],
+            {
+                placeHolder: 'Where would you like to clone the repository?'
+            }
+        );
+
+        if (choice === 'Cancel') {
+            throw new Error('Operation cancelled by user');
+        }
+
+        if (choice === 'Clone in New Location') {
+            const result = await vscode.window.showOpenDialog({
+                canSelectFiles: false,
+                canSelectFolders: true,
+                canSelectMany: false,
+                defaultUri: vscode.Uri.file(this.workspacePath || os.homedir()),
+                openLabel: 'Select Clone Location'
+            });
+
+            if (!result || result.length === 0) {
+                throw new Error('No directory selected for cloning');
             }
 
-            // Directory doesn't exist - clone fresh
-            this.log('Directory does not exist. Cloning fresh...');
-            await fs.mkdir(path.dirname(repoPath), { recursive: true });
-            await this.cloneRepository(repoUrl, repoPath);
+            repoPath = path.join(result[0].fsPath, repoName);
+        }
 
-            // Store diff information before switching workspace
-            const git = simpleGit(repoPath);
-            const currentHead = await git.revparse(['HEAD']);
-            // Use the parent commit as the old version
-            const oldHead = await git.revparse(['HEAD^']) || currentHead;
-            
-            // Create diff files before switching workspace
-            await this.showVisualDiff(repoPath, oldHead, currentHead);
+        // Clone or update the repository
+        await this.cloneRepository(repoUrl, repoPath);
 
-            // Handle workspace switching
-            if (!vscode.workspace.workspaceFolders) {
-                await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(repoPath));
-                throw new Error('WORKSPACE_SWITCHED');
-            } else {
-                await vscode.workspace.updateWorkspaceFolders(
-                    vscode.workspace.workspaceFolders.length,
-                    null,
-                    { uri: vscode.Uri.file(repoPath) }
-                );
+        // Ask user how to handle workspace
+        const workspaceChoice = await vscode.window.showQuickPick(
+            ['Open in New Window', 'Add to Current Workspace', 'Keep Current Window'],
+            {
+                placeHolder: 'How would you like to work with this repository?'
             }
+        );
+
+        if (workspaceChoice === 'Open in New Window') {
+            await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(repoPath));
+            throw new Error('WORKSPACE_SWITCHED');
+        } else if (workspaceChoice === 'Add to Current Workspace') {
+            await vscode.workspace.updateWorkspaceFolders(
+                vscode.workspace.workspaceFolders?.length || 0,
+                null,
+                { uri: vscode.Uri.file(repoPath) }
+            );
         }
 
         return repoPath;
@@ -185,100 +133,128 @@ export class RepoManager {
             const reportsDir = path.join(repoPath, 'diff_reports');
             await fs.mkdir(reportsDir, { recursive: true });
 
-            // Generate timestamp for unique report name
+            // Generate single timestamp for this diff
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const reportName = `diff_${oldCommit.substring(0, 7)}_${newCommit.substring(0, 7)}_${timestamp}`;
-            const reportDir = path.join(reportsDir, reportName);
-            await fs.mkdir(reportDir);
+            const reportName = `diff_${oldCommit.substring(0, 7)}_${newCommit.substring(0, 7)}_${timestamp}.md`;
+            const reportPath = path.join(reportsDir, reportName);
 
-            // Get commit information for report metadata
-            const oldCommitInfo = await git.show([oldCommit, '--format=%h %an %s']);
-            const newCommitInfo = await git.show([newCommit, '--format=%h %an %s']);
+            // Check if report already exists for these commits
+            const existingReports = await fs.readdir(reportsDir);
+            const sameCommitReport = existingReports.find(file => 
+                file.startsWith(`diff_${oldCommit.substring(0, 7)}_${newCommit.substring(0, 7)}_`)
+            );
 
-            // Get diff content
-            let oldContent: string;
-            let newContent: string;
-
-            try {
-                oldContent = await git.show([oldCommit]);
-            } catch (error) {
-                oldContent = '';
-            }
-
-            try {
-                newContent = await git.show([newCommit]);
-            } catch (error) {
-                this.log('Error getting new content, aborting diff view');
+            if (sameCommitReport) {
+                this.log('Report already exists for these commits, using existing report');
+                const existingReportPath = path.join(reportsDir, sameCommitReport);
+                
+                // Show existing report
+                const document = await vscode.workspace.openTextDocument(existingReportPath);
+                await vscode.window.showTextDocument(document, {
+                    preview: true,
+                    viewColumn: vscode.ViewColumn.Two
+                });
                 return;
             }
 
-            // Create report files
-            const oldFile = path.join(reportDir, 'previous_version.txt');
-            const newFile = path.join(reportDir, 'new_version.txt');
-            const metadataFile = path.join(reportDir, 'metadata.json');
+            // Get commit information
+            const [oldCommitInfo, newCommitInfo] = await Promise.all([
+                git.show([oldCommit, '--format=%h %an <%ae> %ai %s']),
+                git.show([newCommit, '--format=%h %an <%ae> %ai %s'])
+            ]);
 
-            // Write content and metadata
-            await fs.writeFile(oldFile, oldContent);
-            await fs.writeFile(newFile, newContent);
-            await fs.writeFile(metadataFile, JSON.stringify({
-                timestamp: new Date().toISOString(),
-                previousCommit: {
-                    hash: oldCommit,
-                    info: oldCommitInfo.split('\n')[0]
-                },
-                newCommit: {
-                    hash: newCommit,
-                    info: newCommitInfo.split('\n')[0]
-                }
-            }, null, 2));
+            // Get the actual diff with stats and file changes
+            const [diffStats, diffPatches] = await Promise.all([
+                git.diff([oldCommit, newCommit, '--stat']),
+                git.diff([oldCommit, newCommit, '--patch', '--unified=3'])
+            ]);
 
-            // Create a summary file
-            const summaryFile = path.join(reportDir, 'summary.txt');
-            const diffSummary = await git.diff([oldCommit, newCommit, '--stat']);
-            await fs.writeFile(summaryFile, `Diff Summary\n${'-'.repeat(40)}\n${diffSummary}`);
+            // Create the report content
+            const reportContent = [
+                `# Change Report: ${new Date().toLocaleString()}`,
+                '',
+                '## Commit Information',
+                '### Previous Commit',
+                '```',
+                oldCommitInfo.split('\n')[0],
+                '```',
+                '',
+                '### New Commit',
+                '```',
+                newCommitInfo.split('\n')[0],
+                '```',
+                '',
+                '## Changes Summary',
+                '```',
+                diffStats,
+                '```',
+                '',
+                '## Detailed Changes',
+                '```diff',
+                diffPatches,
+                '```'
+            ].join('\n');
 
-            // Show diff in VSCode
-            await vscode.commands.executeCommand('vscode.diff',
-                vscode.Uri.file(oldFile),
-                vscode.Uri.file(newFile),
-                `Changes: ${oldCommit.substring(0, 7)} ↔ ${newCommit.substring(0, 7)}`,
-                {
-                    preview: true,
-                    viewColumn: vscode.ViewColumn.Two
-                }
-            );
+            // Write the unified report
+            await fs.writeFile(reportPath, reportContent);
 
-            // Add notification about saved report
-            vscode.window.showInformationMessage(
-                `Diff report saved to: ${reportDir}`,
-                'Open Report Directory'
-            ).then(selection => {
-                if (selection === 'Open Report Directory') {
-                    vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(reportDir));
-                }
+            // Show the report in VSCode
+            const document = await vscode.workspace.openTextDocument(reportPath);
+            await vscode.window.showTextDocument(document, {
+                preview: true,
+                viewColumn: vscode.ViewColumn.Two
             });
 
-            // Add to .gitignore if not already there
-            const gitignorePath = path.join(repoPath, '.gitignore');
-            try {
-                let gitignoreContent = '';
-                try {
-                    gitignoreContent = await fs.readFile(gitignorePath, 'utf8');
-                } catch (error) {
-                    // File doesn't exist yet
-                }
+            // Also show in diff view
+            await vscode.commands.executeCommand('vscode.diff',
+                await this.createTempFileForDiff(oldCommit, await git.show([oldCommit])),
+                await this.createTempFileForDiff(newCommit, await git.show([newCommit])),
+                `Changes: ${oldCommit.substring(0, 7)} ↔ ${newCommit.substring(0, 7)}`,
+                { preview: true, viewColumn: vscode.ViewColumn.Two }
+            );
 
-                if (!gitignoreContent.includes('diff_reports/')) {
-                    const newLine = gitignoreContent.endsWith('\n') ? '' : '\n';
-                    await fs.writeFile(gitignorePath, `${gitignoreContent}${newLine}diff_reports/\n`);
+            // Show notification
+            vscode.window.showInformationMessage(
+                `Diff report saved: ${path.basename(reportPath)}`,
+                'Open Report',
+                'Open Directory'
+            ).then(selection => {
+                if (selection === 'Open Report') {
+                    vscode.workspace.openTextDocument(reportPath)
+                        .then(doc => vscode.window.showTextDocument(doc));
+                } else if (selection === 'Open Directory') {
+                    vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(reportsDir));
                 }
-            } catch (error) {
-                this.log('Unable to update .gitignore, but diff report was still created');
-            }
+            });
 
         } catch (error) {
             this.log(`Error showing and saving diff: ${error instanceof Error ? error.message : 'Unknown error'}`);
             this.log('Continuing without diff view');
+        }
+    }
+
+    private async createTempFileForDiff(commit: string, content: string): Promise<vscode.Uri> {
+        const tempFile = path.join(os.tmpdir(), `vscode-diff-${commit}`);
+        await fs.writeFile(tempFile, content);
+        return vscode.Uri.file(tempFile);
+    }
+
+    private async ensureGitIgnore(repoPath: string): Promise<void> {
+        const gitignorePath = path.join(repoPath, '.gitignore');
+        try {
+            let gitignoreContent = '';
+            try {
+                gitignoreContent = await fs.readFile(gitignorePath, 'utf8');
+            } catch (error) {
+                // File doesn't exist yet
+            }
+
+            if (!gitignoreContent.includes('diff_reports/')) {
+                const newLine = gitignoreContent.endsWith('\n') ? '' : '\n';
+                await fs.writeFile(gitignorePath, `${gitignoreContent}${newLine}diff_reports/\n`);
+            }
+        } catch (error) {
+            this.log('Unable to update .gitignore');
         }
     }
 
